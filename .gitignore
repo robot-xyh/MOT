@@ -1,0 +1,12 @@
+.deps/
+__pycache__/
+*.py[cod]
+
+# Local source videos and generated tracking outputs.
+*.mp4
+outputs/
+
+# Local editor and OS metadata.
+.DS_Store
+.idea/
+.vscode/
