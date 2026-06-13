@@ -40,6 +40,20 @@ class InitBox:
 
 
 @dataclass(frozen=True)
+class AutoInitTarget:
+    x: float
+    y: float
+    width: int
+    height: int
+    score: float
+    motion: float
+    hit_count: int
+    hit_ratio: float
+    first_frame: int
+    last_frame: int
+
+
+@dataclass(frozen=True)
 class TrackRecord:
     frame_idx: int
     time_s: float
@@ -193,6 +207,98 @@ def parse_args() -> argparse.Namespace:
         "--draw-detections",
         action="store_true",
         help="Draw raw detections as small gray crosses in the visualization.",
+    )
+    parser.add_argument(
+        "--detector",
+        choices=("classical", "external-csv"),
+        default="classical",
+        help="Detection source used by automatic tracking and auto initialization.",
+    )
+    parser.add_argument(
+        "--detections-in",
+        type=Path,
+        help="External detection CSV with frame_idx,x,y,width,height,score,class_name columns.",
+    )
+    parser.add_argument(
+        "--external-high-score",
+        type=float,
+        default=0.5,
+        help="High-confidence score threshold for --detector external-csv.",
+    )
+    parser.add_argument(
+        "--external-low-score",
+        type=float,
+        default=0.1,
+        help="Low-confidence score threshold for --detector external-csv.",
+    )
+    parser.add_argument(
+        "--auto-init",
+        action="store_true",
+        help="Automatically initialize stable point targets from the start of the tracked video.",
+    )
+    parser.add_argument(
+        "--auto-init-seconds",
+        type=float,
+        default=2.0,
+        help="Seconds used to discover stable targets for --auto-init.",
+    )
+    parser.add_argument(
+        "--auto-init-min-hits",
+        type=int,
+        default=5,
+        help="Minimum detections required to accept an auto-initialized target.",
+    )
+    parser.add_argument(
+        "--auto-init-min-hit-ratio",
+        type=float,
+        default=0.25,
+        help="Minimum hit ratio in the auto-init window required to accept a target.",
+    )
+    parser.add_argument(
+        "--auto-init-max-targets",
+        type=int,
+        default=8,
+        help="Maximum stable targets kept by --auto-init.",
+    )
+    parser.add_argument(
+        "--auto-init-radius",
+        type=float,
+        default=6.0,
+        help="Pixel radius used to cluster detections during --auto-init.",
+    )
+    parser.add_argument(
+        "--auto-init-min-motion",
+        type=float,
+        default=0.0,
+        help="Minimum displacement in pixels required during auto initialization.",
+    )
+    parser.add_argument(
+        "--auto-init-motion-weight",
+        type=float,
+        default=2.0,
+        help="Ranking weight for motion during auto initialization.",
+    )
+    parser.add_argument(
+        "--auto-correction-radius",
+        type=float,
+        default=6.0,
+        help="Maximum distance for global detection correction after --auto-init.",
+    )
+    parser.add_argument(
+        "--auto-hold-lost-frames",
+        type=int,
+        default=60,
+        help="Frames to keep an auto-initialized track after missed local detections.",
+    )
+    parser.add_argument(
+        "--allow-new-after-init",
+        action="store_true",
+        help="Allow new automatic tracks after --auto-init has locked initial targets.",
+    )
+    parser.add_argument(
+        "--save-auto-init",
+        type=Path,
+        help="Save auto-initialized target metadata to this JSON file.",
     )
     parser.add_argument(
         "--manual-init",
@@ -530,6 +636,112 @@ def detect_tiered_points(
     return high_candidates, recovery_candidates, high_candidates + recovery_candidates
 
 
+def load_external_detections(path: Path) -> dict[int, list[Detection]]:
+    required = {"frame_idx", "x", "y", "width", "height", "score"}
+    detections_by_frame: dict[int, list[Detection]] = {}
+    with path.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        missing = required - set(reader.fieldnames or [])
+        if missing:
+            missing_fields = ", ".join(sorted(missing))
+            raise ValueError(f"External detection CSV is missing required field(s): {missing_fields}")
+        for row_idx, row in enumerate(reader, start=2):
+            try:
+                frame_idx = int(row["frame_idx"])
+                x = float(row["x"])
+                y = float(row["y"])
+                width = max(1, int(round(float(row["width"]))))
+                height = max(1, int(round(float(row["height"]))))
+                score = float(row["score"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid external detection value at CSV row {row_idx}") from exc
+            class_name = (row.get("class_name") or "external").strip() or "external"
+            detection = Detection(
+                x=x,
+                y=y,
+                area=max(1, width * height),
+                width=width,
+                height=height,
+                intensity=math.nan,
+                score=score,
+                contrast=score,
+                source=class_name,
+            )
+            detections_by_frame.setdefault(frame_idx, []).append(detection)
+    return detections_by_frame
+
+
+def external_tiered_points(
+    detections_by_frame: dict[int, list[Detection]],
+    frame_idx: int,
+    high_score: float,
+    low_score: float,
+) -> tuple[list[Detection], list[Detection], list[Detection]]:
+    raw = detections_by_frame.get(frame_idx, [])
+    high: list[Detection] = []
+    low: list[Detection] = []
+    for detection in raw:
+        if detection.score >= high_score:
+            high.append(
+                Detection(
+                    x=detection.x,
+                    y=detection.y,
+                    area=detection.area,
+                    width=detection.width,
+                    height=detection.height,
+                    intensity=detection.intensity,
+                    score=detection.score,
+                    contrast=detection.contrast,
+                    source="external_high",
+                )
+            )
+        elif detection.score >= low_score:
+            low.append(
+                Detection(
+                    x=detection.x,
+                    y=detection.y,
+                    area=detection.area,
+                    width=detection.width,
+                    height=detection.height,
+                    intensity=detection.intensity,
+                    score=detection.score,
+                    contrast=detection.contrast,
+                    source="external_low",
+                )
+            )
+    return high, low, high + low
+
+
+def tiered_detections_for_frame(
+    frame: np.ndarray,
+    frame_idx: int,
+    ignore_mask: np.ndarray,
+    args: argparse.Namespace,
+    external_detections: dict[int, list[Detection]] | None,
+) -> tuple[list[Detection], list[Detection], list[Detection]]:
+    if args.detector == "external-csv":
+        if external_detections is None:
+            raise RuntimeError("--detector external-csv requires loaded external detections")
+        return external_tiered_points(
+            external_detections,
+            frame_idx,
+            high_score=args.external_high_score,
+            low_score=args.external_low_score,
+        )
+    return detect_tiered_points(
+        frame=frame,
+        ignore_mask=ignore_mask,
+        sigma=args.sigma,
+        high_threshold=args.high_threshold,
+        low_threshold=args.low_threshold,
+        high_percentile=args.high_percentile,
+        min_area=args.min_area,
+        max_area=args.max_area,
+        max_width=args.max_width,
+        max_height=args.max_height,
+    )
+
+
 def clamp_box(box: InitBox, width: int, height: int) -> InitBox | None:
     x1 = max(0, min(width - 1, box.x))
     y1 = max(0, min(height - 1, box.y))
@@ -819,6 +1031,153 @@ def initial_detections_from_boxes(
     return selected
 
 
+def discover_auto_init_targets(
+    cap: cv2.VideoCapture,
+    fps: float,
+    frame_count: int,
+    ignore_mask: np.ndarray,
+    args: argparse.Namespace,
+    external_detections: dict[int, list[Detection]] | None,
+) -> tuple[int, list[Detection], list[AutoInitTarget]]:
+    window_frames = max(1, int(round(args.auto_init_seconds * fps)))
+    if frame_count > 0:
+        window_frames = min(window_frames, frame_count)
+    clusters: list[dict[str, float | int]] = []
+    observed_frames = 0
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    for frame_idx in range(window_frames):
+        ok, frame = cap.read()
+        if not ok:
+            break
+        observed_frames += 1
+        high_detections, _, _ = tiered_detections_for_frame(
+            frame=frame,
+            frame_idx=frame_idx,
+            ignore_mask=ignore_mask,
+            args=args,
+            external_detections=external_detections,
+        )
+        for detection in high_detections:
+            best_idx: int | None = None
+            best_distance = float("inf")
+            for cluster_idx, cluster in enumerate(clusters):
+                if int(cluster["last_frame"]) == frame_idx:
+                    continue
+                distance = math.hypot(float(cluster["x"]) - detection.x, float(cluster["y"]) - detection.y)
+                if distance <= args.auto_init_radius and distance < best_distance:
+                    best_idx = cluster_idx
+                    best_distance = distance
+            if best_idx is None:
+                clusters.append(
+                    {
+                        "x": detection.x,
+                        "y": detection.y,
+                        "first_x": detection.x,
+                        "first_y": detection.y,
+                        "last_x": detection.x,
+                        "last_y": detection.y,
+                        "width": detection.width,
+                        "height": detection.height,
+                        "score_sum": detection.score,
+                        "hit_count": 1,
+                        "first_frame": frame_idx,
+                        "last_frame": frame_idx,
+                    }
+                )
+            else:
+                cluster = clusters[best_idx]
+                hit_count = int(cluster["hit_count"]) + 1
+                alpha = 1.0 / hit_count
+                cluster["x"] = (1.0 - alpha) * float(cluster["x"]) + alpha * detection.x
+                cluster["y"] = (1.0 - alpha) * float(cluster["y"]) + alpha * detection.y
+                cluster["width"] = max(int(cluster["width"]), detection.width)
+                cluster["height"] = max(int(cluster["height"]), detection.height)
+                cluster["score_sum"] = float(cluster["score_sum"]) + detection.score
+                cluster["hit_count"] = hit_count
+                cluster["last_x"] = detection.x
+                cluster["last_y"] = detection.y
+                cluster["last_frame"] = frame_idx
+
+    observed_frames = max(1, observed_frames)
+    targets: list[AutoInitTarget] = []
+    for cluster in clusters:
+        hit_count = int(cluster["hit_count"])
+        hit_ratio = hit_count / observed_frames
+        if hit_count < args.auto_init_min_hits or hit_ratio < args.auto_init_min_hit_ratio:
+            continue
+        mean_score = float(cluster["score_sum"]) / hit_count
+        motion = math.hypot(float(cluster["last_x"]) - float(cluster["first_x"]), float(cluster["last_y"]) - float(cluster["first_y"]))
+        if motion < args.auto_init_min_motion:
+            continue
+        targets.append(
+            AutoInitTarget(
+                x=float(cluster["x"]),
+                y=float(cluster["y"]),
+                width=int(cluster["width"]),
+                height=int(cluster["height"]),
+                score=mean_score,
+                motion=motion,
+                hit_count=hit_count,
+                hit_ratio=hit_ratio,
+                first_frame=int(cluster["first_frame"]),
+                last_frame=int(cluster["last_frame"]),
+            )
+        )
+
+    def target_rank(target: AutoInitTarget) -> float:
+        span = max(1, target.last_frame - target.first_frame + 1)
+        return target.hit_ratio * target.score * span * (1.0 + args.auto_init_motion_weight * target.motion)
+
+    targets = sorted(targets, key=target_rank, reverse=True)[: max(0, args.auto_init_max_targets)]
+    detections = [
+        Detection(
+            x=target.x,
+            y=target.y,
+            area=max(1, target.width * target.height),
+            width=target.width,
+            height=target.height,
+            intensity=math.nan,
+            score=target.score,
+            contrast=target.hit_ratio,
+            source="auto_init",
+        )
+        for target in targets
+    ]
+    return observed_frames, detections, targets
+
+
+def save_auto_init_targets(
+    path: Path,
+    video_path: Path,
+    observed_frames: int,
+    fps: float,
+    targets: list[AutoInitTarget],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "video": str(video_path),
+        "observed_frames": observed_frames,
+        "observed_seconds": observed_frames / fps if fps > 0 else 0.0,
+        "targets": [
+            {
+                "x": round(target.x, 3),
+                "y": round(target.y, 3),
+                "width": target.width,
+                "height": target.height,
+                "score": round(target.score, 3),
+                "motion": round(target.motion, 3),
+                "hit_count": target.hit_count,
+                "hit_ratio": round(target.hit_ratio, 6),
+                "first_frame": target.first_frame,
+                "last_frame": target.last_frame,
+            }
+            for target in targets
+        ],
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
 class MultiObjectTracker:
     def __init__(
         self,
@@ -991,6 +1350,8 @@ class MultiObjectTracker:
             primary_stage = "high"
         elif association == "manual":
             primary_stage = "manual"
+        elif association == "auto":
+            primary_stage = "auto"
         else:
             primary_stage = "standard"
         matched_high = match_stage(detections, all_track_indices, primary_stage)
@@ -1224,6 +1585,13 @@ def track_video(video_path: Path, vis_path: Path, csv_path: Path, args: argparse
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if width <= 0 or height <= 0:
         raise RuntimeError(f"Could not read video dimensions from {video_path}")
+    if args.detector == "external-csv" and args.detections_in is None:
+        raise ValueError("--detector external-csv requires --detections-in")
+    if args.detector != "external-csv" and args.detections_in is not None:
+        raise ValueError("--detections-in requires --detector external-csv")
+    if args.save_auto_init is not None and not args.auto_init:
+        raise ValueError("--save-auto-init requires --auto-init")
+    external_detections = load_external_detections(args.detections_in) if args.detections_in is not None else None
 
     vis_path.parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(str(vis_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
@@ -1255,6 +1623,7 @@ def track_video(video_path: Path, vis_path: Path, csv_path: Path, args: argparse
         raise ValueError("--save-init-boxes requires --manual-init")
 
     manual_tracking = bool(init_boxes)
+    auto_tracking = False
     if manual_tracking:
         if init_frame_idx is None:
             init_frame_idx = args.init_frame
@@ -1267,6 +1636,31 @@ def track_video(video_path: Path, vis_path: Path, csv_path: Path, args: argparse
         cap.set(cv2.CAP_PROP_POS_FRAMES, init_frame_idx)
         print(f"Initialized {len(init_detections)} manually selected target(s) at frame {init_frame_idx}")
         frame_idx = init_frame_idx
+    elif args.auto_init:
+        observed_frames, init_detections, auto_targets = discover_auto_init_targets(
+            cap=cap,
+            fps=fps,
+            frame_count=frame_count,
+            ignore_mask=ignore_mask,
+            args=args,
+            external_detections=external_detections,
+        )
+        if not init_detections:
+            raise RuntimeError(
+                "Auto initialization did not find stable targets. "
+                "Try lowering --auto-init-min-hits, --auto-init-min-hit-ratio, or --high-threshold."
+            )
+        if args.save_auto_init is not None:
+            save_auto_init_targets(args.save_auto_init, video_path, observed_frames, fps, auto_targets)
+            print(f"Saved {len(auto_targets)} auto-initialized target(s) -> {args.save_auto_init}")
+        tracker.min_track_length = min(tracker.min_track_length, tracker.min_hits)
+        tracker.max_misses = max(tracker.max_misses, args.auto_hold_lost_frames)
+        tracker.initialize(init_detections)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        print(f"Auto-initialized {len(init_detections)} stable target(s) from {observed_frames} frame(s)")
+        manual_ignore_mask = ignore_mask
+        auto_tracking = True
+        frame_idx = 0
     else:
         manual_ignore_mask = ignore_mask
         frame_idx = 0
@@ -1286,31 +1680,32 @@ def track_video(video_path: Path, vis_path: Path, csv_path: Path, args: argparse
                     if dx or dy:
                         tracker.apply_translation(dx, dy)
 
-                high_detections, low_detections, all_candidates = detect_tiered_points(
+                high_detections, low_detections, all_candidates = tiered_detections_for_frame(
                     frame=frame,
+                    frame_idx=frame_idx,
                     ignore_mask=manual_ignore_mask,
-                    sigma=args.sigma,
-                    high_threshold=args.high_threshold,
-                    low_threshold=args.low_threshold,
-                    high_percentile=args.high_percentile,
-                    min_area=args.min_area,
-                    max_area=args.max_area,
-                    max_width=args.max_width,
-                    max_height=args.max_height,
+                    args=args,
+                    external_detections=external_detections,
                 )
                 detections = high_detections
                 debug_candidates = all_candidates
                 already_predicted = False
-                if manual_tracking:
+                locked_tracking = manual_tracking or auto_tracking
+                if locked_tracking:
                     tracker.predict_all()
                     already_predicted = True
-                    manual_global_detections = high_detections if args.manual_global_correction else []
+                    if manual_tracking:
+                        correction_detections = high_detections if args.manual_global_correction else []
+                        association = "manual"
+                    else:
+                        correction_detections = high_detections
+                        association = "auto"
                     detections = manual_track_detections(
                         frame=frame,
                         tracks=tracker.active,
-                        global_detections=manual_global_detections,
+                        global_detections=correction_detections,
                         local_radius=args.manual_search_radius,
-                        correction_radius=args.manual_correction_radius,
+                        correction_radius=args.manual_correction_radius if manual_tracking else args.auto_correction_radius,
                         sigma=args.sigma,
                         min_score=args.manual_min_score,
                         tbd_window=args.tbd_window,
@@ -1318,14 +1713,16 @@ def track_video(video_path: Path, vis_path: Path, csv_path: Path, args: argparse
                     )
                     low_detections = []
                     debug_candidates = all_candidates + detections
+                else:
+                    association = args.association
                 visible_tracks = tracker.update(
                     detections,
                     frame_idx,
                     time_s,
-                    allow_new_tracks=not manual_tracking,
+                    allow_new_tracks=(not locked_tracking or args.allow_new_after_init),
                     already_predicted=already_predicted,
                     low_detections=low_detections,
-                    association="manual" if manual_tracking else args.association,
+                    association=association,
                     drop_lost_tracks=(not manual_tracking or args.manual_drop_lost),
                 )
                 debug_writer.write(frame_idx, time_s, debug_candidates)
